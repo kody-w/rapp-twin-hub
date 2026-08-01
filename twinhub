@@ -1,0 +1,520 @@
+#!/usr/bin/env python3
+"""
+twinhub — resolve and apply twin archetypes.
+
+    twinhub list
+    twinhub show founder
+    twinhub resolve founder
+    twinhub apply founder --home ~/.rapp/twin
+    twinhub check
+    twinhub index
+
+An archetype says HOW a twin behaves. It never says WHO it is. This tool only
+ever moves data one way — hub to device — and there is deliberately no command
+here that publishes a profile.
+
+Zero dependencies beyond the Python standard library.
+
+https://github.com/kody-w/rapp-twin-hub
+"""
+
+from __future__ import annotations
+
+__version__ = "1.0.0"
+SCHEMA = "rapp-twin-archetype/1.0"
+
+import argparse
+import json
+import os
+import re
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+MAX_DEPTH = 8
+DEFAULT_REMOTE = "https://kody-w.github.io/rapp-twin-hub"
+
+# Fields an archetype may carry. Anything else is rejected rather than passed
+# through — that is what stops a crafted archetype smuggling a field an older
+# client stores blindly.
+ALLOWED_TOP = {
+    "schema", "id", "name", "summary", "extends",
+    "voice", "boundaries", "practices", "prompts", "tags", "author", "version",
+}
+ALLOWED_VOICE = {"tone", "avoid", "signatures"}
+ALLOWED_BOUNDARIES = {"mayDo", "mustAsk", "neverDo"}
+
+ID_PATTERN = re.compile(r"^[a-z][a-z0-9-]{1,38}[a-z0-9]$")
+
+
+class HubError(Exception):
+    """User-facing error — printed without a traceback."""
+
+
+# ---------------------------------------------------------------------------
+# loading
+# ---------------------------------------------------------------------------
+
+
+def archetypes_dir() -> Path:
+    env = os.environ.get("RAPP_TWIN_HUB")
+    if env:
+        return Path(os.path.expanduser(env))
+    local = Path(__file__).resolve().parent / "archetypes"
+    return local
+
+
+def validate(data: Any, source: str) -> dict:
+    """Reject anything that does not conform, rather than half-loading it."""
+    if not isinstance(data, dict):
+        raise HubError(f"{source}: not a JSON object")
+
+    if data.get("schema") != SCHEMA:
+        raise HubError(f"{source}: expected schema {SCHEMA}, got {data.get('schema')!r}")
+
+    unknown = set(data) - ALLOWED_TOP
+    if unknown:
+        raise HubError(f"{source}: unknown field(s) {sorted(unknown)} — refusing to load")
+
+    identifier = data.get("id")
+    if not isinstance(identifier, str) or not ID_PATTERN.match(identifier):
+        raise HubError(f"{source}: invalid id {identifier!r}")
+
+    for key in ("name", "summary"):
+        if not isinstance(data.get(key), str) or not data[key].strip():
+            raise HubError(f"{source}: {key} is required")
+
+    voice = data.get("voice") or {}
+    if not isinstance(voice, dict) or (set(voice) - ALLOWED_VOICE):
+        raise HubError(f"{source}: invalid voice section")
+
+    boundaries = data.get("boundaries") or {}
+    if not isinstance(boundaries, dict) or (set(boundaries) - ALLOWED_BOUNDARIES):
+        raise HubError(f"{source}: invalid boundaries section")
+    for required in ("mustAsk", "neverDo"):
+        if required not in boundaries:
+            raise HubError(f"{source}: boundaries.{required} is required")
+
+    for section in (voice, boundaries):
+        for key, value in section.items():
+            if not isinstance(value, list) or any(not isinstance(v, str) for v in value):
+                raise HubError(f"{source}: {key} must be a list of strings")
+
+    return data
+
+
+def load_local(identifier: str, directory: Path | None = None) -> dict:
+    directory = directory or archetypes_dir()
+    path = directory / f"{identifier}.json"
+    if not path.exists():
+        raise HubError(f"no archetype {identifier!r} in {directory}")
+    try:
+        return validate(json.loads(path.read_text(encoding="utf-8")), str(path))
+    except json.JSONDecodeError as exc:
+        raise HubError(f"{path}: invalid JSON ({exc})") from exc
+
+
+def load_remote(identifier: str, remote: str, timeout: float = 15.0) -> dict:
+    url = f"{remote.rstrip('/')}/archetypes/{identifier}.json"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as response:  # noqa: S310
+            return validate(json.loads(response.read().decode("utf-8")), url)
+    except urllib.error.HTTPError as exc:
+        raise HubError(f"{url}: HTTP {exc.code}") from exc
+    except urllib.error.URLError as exc:
+        raise HubError(f"{url}: {exc.reason}") from exc
+
+
+def loader_for(directory: Path | None, remote: str | None):
+    def load(identifier: str) -> dict:
+        if remote:
+            return load_remote(identifier, remote)
+        return load_local(identifier, directory)
+
+    return load
+
+
+def available(directory: Path | None = None) -> list[dict]:
+    directory = directory or archetypes_dir()
+    if not directory.exists():
+        return []
+    found = []
+    for path in sorted(directory.glob("*.json")):
+        try:
+            found.append(validate(json.loads(path.read_text(encoding="utf-8")), str(path)))
+        except (HubError, json.JSONDecodeError):
+            continue
+    return found
+
+
+# ---------------------------------------------------------------------------
+# resolution
+# ---------------------------------------------------------------------------
+
+
+def _union(*lists: list[str]) -> list[str]:
+    """Order-preserving, case-insensitive de-duplication."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for source in lists:
+        for item in source or []:
+            key = item.strip().lower()
+            if key and key not in seen:
+                seen.add(key)
+                out.append(item)
+    return out
+
+
+def resolve(identifier: str, load=None, _chain: tuple[str, ...] = ()) -> dict:
+    """
+    Walk `extends` to the root and merge back down.
+
+    Boundaries are additive: a child can add `mustAsk`/`neverDo` but never
+    remove one, and a `mayDo` that contradicts an ancestor's restriction is
+    dropped. Without that, anyone could publish an archetype that quietly
+    disarms everything downstream of it.
+    """
+    load = load or (lambda i: load_local(i))
+
+    if identifier in _chain:
+        raise HubError("archetype cycle: " + " -> ".join([*_chain, identifier]))
+    if len(_chain) >= MAX_DEPTH:
+        raise HubError(f"archetype chain deeper than {MAX_DEPTH}: {' -> '.join(_chain)}")
+
+    node = load(identifier)
+    parent_id = node.get("extends")
+    if not parent_id:
+        merged = json.loads(json.dumps(node))
+        merged.setdefault("voice", {})
+        merged.setdefault("boundaries", {})
+        merged["lineage"] = [identifier]
+        return merged
+
+    parent = resolve(parent_id, load, (*_chain, identifier))
+
+    voice_parent = parent.get("voice") or {}
+    voice_child = node.get("voice") or {}
+    bounds_parent = parent.get("boundaries") or {}
+    bounds_child = node.get("boundaries") or {}
+
+    must_ask = _union(bounds_parent.get("mustAsk"), bounds_child.get("mustAsk"))
+    never_do = _union(bounds_parent.get("neverDo"), bounds_child.get("neverDo"))
+
+    restricted = {p.strip().lower() for p in (*must_ask, *never_do)}
+    may_do = [
+        entry
+        for entry in _union(bounds_parent.get("mayDo"), bounds_child.get("mayDo"))
+        if entry.strip().lower() not in restricted
+    ]
+
+    return {
+        "schema": SCHEMA,
+        "id": node["id"],
+        "name": node["name"],
+        "summary": node["summary"],
+        "extends": parent_id,
+        "lineage": [*parent.get("lineage", []), node["id"]],
+        "voice": {
+            key: _union(voice_parent.get(key), voice_child.get(key))
+            for key in ("tone", "avoid", "signatures")
+            if _union(voice_parent.get(key), voice_child.get(key))
+        },
+        "boundaries": {
+            key: value
+            for key, value in (("mayDo", may_do), ("mustAsk", must_ask), ("neverDo", never_do))
+            if value
+        },
+        "practices": _union(parent.get("practices"), node.get("practices")),
+        "prompts": _union(parent.get("prompts"), node.get("prompts")),
+        "tags": _union(parent.get("tags"), node.get("tags")),
+    }
+
+
+# ---------------------------------------------------------------------------
+# applying to a device profile
+# ---------------------------------------------------------------------------
+
+
+def apply_to_profile(profile: dict, resolved: dict) -> tuple[dict, dict]:
+    """
+    Add an archetype to a profile without overwriting anything the owner wrote.
+
+    Identity, roles, context and accounts are never touched — an archetype has
+    no business supplying who someone is. Applying twice is a no-op.
+    """
+    updated = json.loads(json.dumps(profile))
+    before = json.dumps(updated, sort_keys=True)
+
+    voice = updated.setdefault("voice", {})
+    for key in ("tone", "avoid", "signatures"):
+        # Owner entries first: their own words outrank an inherited default.
+        voice[key] = _union(voice.get(key), (resolved.get("voice") or {}).get(key))
+
+    boundaries = updated.setdefault("boundaries", {})
+    for key in ("mayDo", "mustAsk", "neverDo"):
+        boundaries[key] = _union(boundaries.get(key), (resolved.get("boundaries") or {}).get(key))
+
+    inherits = updated.setdefault("inherits", [])
+    for ancestor in resolved.get("lineage", [resolved["id"]]):
+        if ancestor not in inherits:
+            inherits.append(ancestor)
+
+    changed = json.dumps(updated, sort_keys=True) != before
+    summary = {
+        "applied": resolved["id"],
+        "lineage": resolved.get("lineage", [resolved["id"]]),
+        "changed": changed,
+        "voice": {k: len(v) for k, v in voice.items()},
+        "boundaries": {k: len(v) for k, v in boundaries.items()},
+    }
+    return updated, summary
+
+
+# ---------------------------------------------------------------------------
+# the vault, read and written in place
+# ---------------------------------------------------------------------------
+
+
+def vault_profile_path(home: str | None) -> Path:
+    root = home or os.environ.get("RAPP_TWIN_HOME") or "~/.rapp/twin"
+    return Path(os.path.expanduser(root)) / "profile.json"
+
+
+def read_profile(path: Path) -> dict:
+    if not path.exists():
+        raise HubError(f"no twin at {path.parent} — create one first (openrappter twin init, or rsb-style twin tooling)")
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise HubError(f"{path}: invalid JSON ({exc})") from exc
+
+
+def write_profile(path: Path, profile: dict) -> None:
+    """Atomic, and 0600 — a profile is as sensitive as a password file."""
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temp = path.with_suffix(".tmp")
+    temp.write_text(json.dumps(profile, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    os.chmod(temp, 0o600)
+    os.replace(temp, path)
+
+
+# ---------------------------------------------------------------------------
+# commands
+# ---------------------------------------------------------------------------
+
+
+def build_index(directory: Path | None = None) -> dict:
+    entries = [
+        {
+            "id": a["id"],
+            "name": a["name"],
+            "summary": a["summary"],
+            "extends": a.get("extends"),
+            "tags": a.get("tags", []),
+            "version": a.get("version"),
+        }
+        for a in available(directory)
+    ]
+    return {
+        "schema": "rapp-twin-hub-index/1.0",
+        "count": len(entries),
+        "archetypes": entries,
+    }
+
+
+def cmd_list(args) -> int:
+    entries = available(Path(args.dir) if args.dir else None)
+    if args.json:
+        print(json.dumps(build_index(Path(args.dir) if args.dir else None), indent=2))
+        return 0
+    if not entries:
+        print("  (no archetypes found)")
+        return 1
+    width = max(len(a["id"]) for a in entries)
+    for archetype in entries:
+        parent = f"  ← {archetype['extends']}" if archetype.get("extends") else ""
+        print(f"  {archetype['id']:<{width}}  {archetype['summary']}{parent}")
+    return 0
+
+
+def cmd_show(args) -> int:
+    archetype = loader_for(Path(args.dir) if args.dir else None, args.remote)(args.id)
+    print(json.dumps(archetype, indent=2, ensure_ascii=False))
+    return 0
+
+
+def cmd_resolve(args) -> int:
+    resolved = resolve(args.id, loader_for(Path(args.dir) if args.dir else None, args.remote))
+    if args.json:
+        print(json.dumps(resolved, indent=2, ensure_ascii=False))
+        return 0
+
+    print(f"\n  {resolved['name']}  ({' → '.join(resolved['lineage'])})")
+    print(f"  {resolved['summary']}\n")
+    for key, label in (("tone", "Sound"), ("avoid", "Never sound")):
+        values = (resolved.get("voice") or {}).get(key)
+        if values:
+            print(f"  {label}: {', '.join(values)}")
+    for key, label in (("mustAsk", "Ask first"), ("neverDo", "Never")):
+        values = (resolved.get("boundaries") or {}).get(key)
+        if values:
+            print(f"\n  {label}:")
+            for value in values:
+                print(f"    - {value}")
+    if resolved.get("prompts"):
+        print("\n  To make it yours, answer:")
+        for prompt in resolved["prompts"]:
+            print(f"    - {prompt}")
+    print()
+    return 0
+
+
+def cmd_apply(args) -> int:
+    resolved = resolve(args.id, loader_for(Path(args.dir) if args.dir else None, args.remote))
+    path = vault_profile_path(args.home)
+    profile = read_profile(path)
+    updated, summary = apply_to_profile(profile, resolved)
+
+    if args.dry_run:
+        print(json.dumps(summary, indent=2))
+        return 0
+
+    write_profile(path, updated)
+
+    if args.json:
+        print(json.dumps(summary, indent=2))
+    else:
+        verb = "Applied" if summary["changed"] else "Already had"
+        print(f"\n  {verb} {' → '.join(summary['lineage'])} to your twin.")
+        print(f"  Voice: {summary['voice']}")
+        print(f"  Boundaries: {summary['boundaries']}")
+        print(f"\n  {path}")
+        print("  Nothing left this machine.\n")
+    return 0
+
+
+def cmd_check(args) -> int:
+    """Every archetype must load, resolve, and carry nothing personal."""
+    directory = Path(args.dir) if args.dir else archetypes_dir()
+    problems: list[str] = []
+    entries = []
+
+    for path in sorted(directory.glob("*.json")):
+        try:
+            entries.append(validate(json.loads(path.read_text(encoding="utf-8")), path.name))
+        except (HubError, json.JSONDecodeError) as exc:
+            problems.append(str(exc))
+
+    known = {a["id"] for a in entries}
+    for archetype in entries:
+        if archetype["id"] != f"{archetype['id']}":
+            problems.append(f"{archetype['id']}: id/filename mismatch")
+        parent = archetype.get("extends")
+        if parent and parent not in known:
+            problems.append(f"{archetype['id']}: extends unknown archetype {parent!r}")
+        try:
+            resolve(archetype["id"], lambda i: load_local(i, directory))
+        except HubError as exc:
+            problems.append(str(exc))
+
+    # An archetype is generic by construction. Anything that looks like a
+    # person is a publishing mistake, and CI should catch it here.
+    personal = re.compile(
+        r"[\w.+-]+@[\w-]+\.\w+"           # email
+        r"|\+?\d[\d\s().-]{8,}\d"          # phone
+        r"|\b\d{1,5}\s+[A-Z][a-z]+\s+(?:St|Street|Ave|Avenue|Rd|Road|Blvd|Lane|Ln|Dr|Drive)\b"
+    )
+    for archetype in entries:
+        blob = json.dumps(archetype)
+        for hit in personal.findall(blob):
+            problems.append(f"{archetype['id']}: looks personal — {hit!r}")
+
+    if args.json:
+        print(json.dumps({"ok": not problems, "checked": len(entries), "problems": problems}, indent=2))
+    elif problems:
+        print(f"\n  {len(problems)} problem(s):")
+        for problem in problems:
+            print(f"    - {problem}")
+        print()
+    else:
+        print(f"\n  {len(entries)} archetypes: all valid, all resolvable, nothing personal.\n")
+
+    return 1 if problems else 0
+
+
+def cmd_index(args) -> int:
+    directory = Path(args.dir) if args.dir else archetypes_dir()
+    index = build_index(directory)
+    body = json.dumps(index, indent=2, ensure_ascii=False) + "\n"
+
+    if args.output:
+        out = Path(os.path.expanduser(args.output))
+        out.parent.mkdir(parents=True, exist_ok=True)
+        if args.check:
+            existing = out.read_text(encoding="utf-8") if out.exists() else ""
+            if existing != body:
+                print(f"  {out} is out of date — run: twinhub index -o {out}")
+                return 1
+            print(f"  {out} is up to date ({index['count']} archetypes).")
+            return 0
+        out.write_text(body, encoding="utf-8")
+        print(f"  Wrote {out} ({index['count']} archetypes).")
+    else:
+        print(body, end="")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="twinhub",
+        description="Inheritable twin archetypes. How a twin behaves — never who it is.",
+        epilog="https://github.com/kody-w/rapp-twin-hub",
+    )
+    parser.add_argument("--version", action="version", version=f"twinhub {__version__} ({SCHEMA})")
+    parser.add_argument("--dir", help="archetype directory (default: ./archetypes or $RAPP_TWIN_HUB)")
+    parser.add_argument("--remote", nargs="?", const=DEFAULT_REMOTE, help="load over HTTPS instead of from disk")
+    subs = parser.add_subparsers(dest="command", required=True)
+
+    listing = subs.add_parser("list", help="every archetype")
+    listing.add_argument("--json", action="store_true")
+    listing.set_defaults(func=cmd_list)
+
+    show = subs.add_parser("show", help="one archetype, unresolved")
+    show.add_argument("id")
+    show.set_defaults(func=cmd_show)
+
+    resolved = subs.add_parser("resolve", help="an archetype with its whole lineage merged in")
+    resolved.add_argument("id")
+    resolved.add_argument("--json", action="store_true")
+    resolved.set_defaults(func=cmd_resolve)
+
+    apply_cmd = subs.add_parser("apply", help="add an archetype to your local twin")
+    apply_cmd.add_argument("id")
+    apply_cmd.add_argument("--home", help="vault directory (default $RAPP_TWIN_HOME or ~/.rapp/twin)")
+    apply_cmd.add_argument("--dry-run", action="store_true")
+    apply_cmd.add_argument("--json", action="store_true")
+    apply_cmd.set_defaults(func=cmd_apply)
+
+    check = subs.add_parser("check", help="validate every archetype (used by CI)")
+    check.add_argument("--json", action="store_true")
+    check.set_defaults(func=cmd_check)
+
+    index = subs.add_parser("index", help="generate api/index.json")
+    index.add_argument("--output", "-o")
+    index.add_argument("--check", action="store_true", help="fail if the index has drifted")
+    index.set_defaults(func=cmd_index)
+
+    args = parser.parse_args(argv)
+    try:
+        return args.func(args)
+    except HubError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

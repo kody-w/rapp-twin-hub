@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kody-w.github.io/rapp-twin-hub/schema/archetype-1.0.json",
+  "title": "rapp-twin-archetype/1.0",
+  "description": "An inheritable twin archetype. Carries HOW a twin behaves, never WHO it is. Personal content lives only in the owner's device vault and is never published here.",
+  "type": "object",
+  "required": ["schema", "id", "name", "summary", "voice", "boundaries"],
+  "additionalProperties": false,
+
+  "properties": {
+    "schema": { "const": "rapp-twin-archetype/1.0" },
+
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]{1,38}[a-z0-9]$",
+      "description": "Stable, lowercase, hyphenated. Used as the filename."
+    },
+
+    "name": { "type": "string", "minLength": 1, "maxLength": 60 },
+    "summary": { "type": "string", "minLength": 1, "maxLength": 200 },
+
+    "extends": {
+      "type": "string",
+      "description": "Another archetype id. Resolution is depth-first, child wins, cycles rejected."
+    },
+
+    "voice": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "tone": { "$ref": "#/$defs/phrases" },
+        "avoid": { "$ref": "#/$defs/phrases" },
+        "signatures": { "$ref": "#/$defs/phrases" }
+      }
+    },
+
+    "boundaries": {
+      "type": "object",
+      "required": ["mustAsk", "neverDo"],
+      "additionalProperties": false,
+      "description": "The mandate. Inherited boundaries are additive and cannot be weakened by a child.",
+      "properties": {
+        "mayDo": { "$ref": "#/$defs/phrases" },
+        "mustAsk": { "$ref": "#/$defs/phrases" },
+        "neverDo": { "$ref": "#/$defs/phrases" }
+      }
+    },
+
+    "practices": {
+      "$ref": "#/$defs/phrases",
+      "description": "How this archetype works. Habits, not facts about a person."
+    },
+
+    "prompts": {
+      "type": "array",
+      "maxItems": 12,
+      "description": "Questions that help an owner fill in their own twin. Never answers.",
+      "items": { "type": "string", "minLength": 1, "maxLength": 200 }
+    },
+
+    "tags": {
+      "type": "array",
+      "maxItems": 12,
+      "items": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$" }
+    },
+
+    "author": { "type": "string", "maxLength": 60 },
+    "version": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$" }
+  },
+
+  "$defs": {
+    "phrases": {
+      "type": "array",
+      "maxItems": 40,
+      "items": { "type": "string", "minLength": 1, "maxLength": 200 }
+    }
+  }
+}

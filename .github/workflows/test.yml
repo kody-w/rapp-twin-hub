@@ -1,0 +1,22 @@
+name: tests
+on:
+  push: { branches: [main] }
+  pull_request:
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.9", "3.12", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "${{ matrix.python }}" }
+      - name: Suite (no dependencies to install)
+        run: python3 tests/run.py
+      - name: Archetypes are valid and carry nothing personal
+        run: python3 twinhub check
+      - name: The published index is current
+        run: python3 twinhub index -o api/index.json --check
