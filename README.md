@@ -2,6 +2,10 @@
 
 # 🧬 RAPP Twin Hub
 
+<!-- rapp1:network-header:start -->
+[![RAPP/1](https://kody-w.github.io/rapp-hive-public/portfolio/badges/rapp-twin-hub.svg)](https://github.com/kody-w/rapp-hive-public/blob/main/portfolio/repos/rapp-twin-hub.md) · **New to RAPP?** [Start here: get your Brainstem →](https://github.com/kody-w/rapp-installer#start-here)
+<!-- rapp1:network-header:end -->
+
 **Twins that inherit — without anyone's private life leaving their laptop.**
 
 An archetype says **how** a twin behaves. It never says **who** it is.
